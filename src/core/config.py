@@ -104,8 +104,14 @@ def get_blue_provider() -> str:
 
 
 def get_blue_model() -> str:
-    # Hard-locked; env cannot override for the graded Blue Team path.
-    return BLUE_MODEL
+    """Model Blue. Mặc định giữ model khóa của lab (OpenRouter).
+
+    Ghi chú bài nộp: tác giả gọi thẳng API Liquid AI
+    (``OPENROUTER_BASE_URL=https://api.liquid.ai/openai/v1``) với cùng model
+    LFM3 1.7B, nhưng tên model trên API đó là ``lfm3-1.7b``, nên cho phép
+    ``BLUE_MODEL`` trong ``.env`` ghi đè. Không đặt ``BLUE_MODEL`` → hành vi gốc.
+    """
+    return os.environ.get("BLUE_MODEL", "").strip() or BLUE_MODEL
 
 
 def get_openrouter_api_key() -> str:
