@@ -1,0 +1,27 @@
+{
+  "total_requests": 36,
+  "blocked_requests": 17,
+  "block_rate": 0.4722222222222222,
+  "rate_limit_hits": 5,
+  "judge_checks": 0,
+  "judge_fails": 0,
+  "judge_fail_rate": 0.0,
+  "alerts": [
+    {
+      "metric": "rate_limit_hits",
+      "value": 5.0,
+      "threshold": 5.0,
+      "message": "5 request bị rate limit — nghi spam / tấn công chi phí."
+    }
+  ],
+  "blocked_by_layer": {
+    "input_guardrail:injection": 8,
+    "input_guardrail:topic": 4,
+    "rate_limiter": 5
+  },
+  "thresholds": {
+    "block_rate": 0.5,
+    "rate_limit_hits": 5,
+    "judge_fail_rate": 0.3
+  }
+}
