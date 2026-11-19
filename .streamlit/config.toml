@@ -1,0 +1,7 @@
+# Chỉ lắng nghe trên máy này: app dùng API key trong .env và hiển thị secret demo.
+[server]
+address = "127.0.0.1"
+port = 8501
+
+[browser]
+gatherUsageStats = false

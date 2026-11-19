@@ -1,0 +1,3 @@
+# Chỉ cho giao diện chat (ui/chat_app.py), không cần để chấm bài.
+-r requirements.txt
+streamlit>=1.57
