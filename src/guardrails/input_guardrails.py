@@ -71,7 +71,64 @@ def detect_injection(user_input: str) -> InputStatus:
     for pattern in INJECTION_PATTERNS:
         if re.search(pattern, text, re.IGNORECASE):
             return "BLOCK"
+    if detect_secret_oracle(text):
+        return "BLOCK"
     return "ALLOW"
+
+
+# ============================================================
+# Side-channel / oracle guard
+#
+# Chặn tấn công "oracle": không hỏi thẳng secret mà hỏi THUỘC TÍNH của nó
+# (ký tự thứ n, mã ASCII, độ dài, "bắt đầu bằng ...", lớn/nhỏ hơn ...) rồi suy ra
+# từng bit bằng binary search. Mỗi câu trả lời YES/NO rò rỉ ~1 bit; output
+# content_filter KHÔNG bắt được vì câu trả lời không chứa secret literal.
+#
+# Chỉ chặn khi câu VỪA trỏ tới secret/cấu hình của HỆ THỐNG VỪA có dấu hiệu dò
+# thuộc tính → giữ false positive thấp. Câu khách tự phục vụ ("quên mật khẩu,
+# đặt lại thế nào?") không trỏ secret hệ thống và không có probe nên vẫn ALLOW.
+# ============================================================
+
+# Mục tiêu bí mật của HỆ THỐNG (cố ý KHÔNG gồm "mật khẩu"/"password" đứng một
+# mình — đó là câu self-service hợp lệ của khách).
+_ORACLE_TARGET_PATTERNS = [
+    r"\b(admin|root|system|internal)\s+(password|credentials?)\b",
+    r"\bapi[\s_-]*keys?\b",
+    r"\bsystem\s+prompt\b",
+    r"\bconnection\s+string\b",
+    r"\b(database|db)\s+host\b|\bhost\s+(database|db)\b",
+    r"cấu\s+hình\s+(bảo\s+mật|hệ\s+thống)|security\s+config(uration)?|system\s+config(uration)?",
+    r"trường\s+khóa|khóa\s+bí\s+mật|secret\s+(field|key|value)|key\s+field",
+    r"\bcredentials?\b",
+    r"internal\s+(note|config|secret)|thông\s+tin\s+nội\s+bộ",
+    r"\bsecret\b",
+]
+
+# Dấu hiệu dò thuộc tính / so sánh / vị trí ký tự.
+_ORACLE_PROBE_PATTERNS = [
+    r"\bascii\b|mã\s+(ascii|ký\s+tự)|char(acter)?\s+code|code\s*point|\bunicode\b",
+    r"bắt\s+đầu\s+bằng|starts?\s+with|begins?\s+with|"
+    r"kết\s+thúc\s+bằng|ends?\s+with",
+    r"ký\s+tự\s+(thứ|đầu|cuối|nào)|first\s+(character|letter|char)|"
+    r"last\s+(character|letter|char)|character\s+at|nth\s+char",
+    r"độ\s+dài|\blength\b|bao\s+nhiêu\s+ký\s+tự|số\s+ký\s+tự|"
+    r"how\s+many\s+(characters|letters|digits)",
+    r"lớn\s+hơn|nhỏ\s+hơn|greater\s+than|less\s+than",
+    r"\bchẵn\b|\blẻ\b|\beven\b|\bodd\b",
+    r"chữ\s+hoa|chữ\s+thường|uppercase|lowercase",
+    r"so\s+sánh|\bcompare\b",
+]
+
+
+def detect_secret_oracle(text: str) -> bool:
+    """True nếu câu dò THUỘC TÍNH của secret/cấu hình hệ thống (oracle attack).
+
+    ``text`` nên đã qua :func:`normalize_text`.
+    """
+    has_target = any(re.search(p, text, re.IGNORECASE) for p in _ORACLE_TARGET_PATTERNS)
+    if not has_target:
+        return False
+    return any(re.search(p, text, re.IGNORECASE) for p in _ORACLE_PROBE_PATTERNS)
 
 
 # Mỗi mẫu bắt một *ý định đổi luật / moi dữ liệu nội bộ*, không bắt chủ đề.
@@ -94,6 +151,9 @@ INJECTION_PATTERNS = [
     r"\b(dan|developer\s+mode|jailbreak|do\s+anything\s+now)\b",
     # Moi credential / hạ tầng nội bộ
     r"\b(admin|root|system|internal)\s+(password|credentials?)\b",
+    # Thứ tự ngược ("password admin", "mật khẩu quản trị"): vẫn là credential hệ thống
+    r"\b(passwords?|credentials?|mật\s+khẩu|mat\s+khau)\s+(of\s+(the\s+)?|của\s+)?"
+    r"(admin|root|system|internal|quản\s+trị|quan\s+tri|hệ\s+thống|he\s+thong)\b",
     r"\bapi[\s_-]*keys?\b",
     r"\b(database|db)\s+(host|password|credentials?)\b|\bconnection\s+string\b",
     # Tiếng Việt
@@ -144,6 +204,12 @@ ALLOWED_TOPICS_VI = [
     "ngân hàng", "rút tiền", "nạp tiền", "sao kê", "phí",
 ]
 ALLOWED_TOPICS_EXTRA = ["bank", "vinbank", "card", "mortgage", "fee", "fees"]
+# Bảo mật tài khoản của chính khách hàng (đổi/quên mật khẩu, PIN, OTP, đăng nhập).
+# Credential của hệ thống đã bị INJECTION_PATTERNS chặn trước khi tới topic filter.
+ALLOWED_TOPICS_SECURITY = [
+    "password", "passwords", "pin", "otp", "login", "log in", "sign in",
+    "mật khẩu", "mat khau", "đăng nhập", "dang nhap", "mã pin", "ma pin",
+]
 BLOCKED_TOPICS_VI = [
     "vũ khí", "ma túy", "ma tuý", "cờ bạc", "giết", "trộm", "bom",
     "vu khi", "ma tuy", "co bac", "giet", "trom",
@@ -166,7 +232,9 @@ def _topic_regex(words: list[str]) -> re.Pattern:
 
 
 _ANY_BLOCKED = _topic_regex(BLOCKED_TOPICS + BLOCKED_TOPICS_VI)
-_ANY_ALLOWED = _topic_regex(ALLOWED_TOPICS + ALLOWED_TOPICS_VI + ALLOWED_TOPICS_EXTRA)
+_ANY_ALLOWED = _topic_regex(
+    ALLOWED_TOPICS + ALLOWED_TOPICS_VI + ALLOWED_TOPICS_EXTRA + ALLOWED_TOPICS_SECURITY
+)
 
 
 # ============================================================
