@@ -6,13 +6,71 @@ Checkpoint 2 — Output Guardrails
 """
 import re
 import textwrap
+import unicodedata
 
 from google.genai import types
 from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
 
+from core.config import DEMO_SECRETS
 from core.utils import chat_with_agent
+
+
+# ============================================================
+# Bộ mẫu nhạy cảm DÙNG CHUNG: content_filter (CP2) + is_egress_allowed (CP3).
+# Thứ tự quan trọng: secret trước, phone trước national_id.
+# ============================================================
+
+SENSITIVE_PATTERNS = {
+    # sk-vinbank-secret-2024, sk-demo-key-abc123
+    "api_key": r"\bsk-[a-z0-9][a-z0-9_-]{5,}",
+    # "password=Secret!99", "password: x" → mọi giá trị;
+    # "password is admin123" → chỉ khi giá trị có số/ký tự đặc biệt, để câu
+    # "your password is never shared" KHÔNG bị coi là lộ secret.
+    "password": r"\b(?:password|passwd|pwd|mật\s*khẩu)\s*(?:[:=]\s*\S+|(?:is|là)\s+\S*[\d!@#$%^&*]\S*)"
+                r"|\badmin123\b",
+    # db.vinbank.internal:5432 và mọi host *.internal
+    "db_host": r"\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.internal(?::\d+)?\b",
+    # SĐT VN 10–11 số, bắt đầu 0 hoặc +84. Hotline 1900… không khớp.
+    "phone": r"(?<!\d)(?:\+84|0)(?:[\s.-]?\d){9,10}(?!\d)",
+    "email": r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[a-z]{2,}\b",
+    # CMND 9 số / CCCD 12 số. Giới hạn: số tiền 9 chữ số viết liền cũng khớp.
+    "national_id": r"(?<!\d)(?:\d{12}|\d{9})(?!\d)",
+}
+SECRET_TYPES = {"api_key", "password", "db_host", "known_secret"}
+
+# Liên hệ công khai trong ground truth (data/pii_hallucination_samples.json):
+# không phải PII khách hàng nên không che trong câu trả lời.
+OFFICIAL_CONTACTS = {"support@vinbank.example"}
+
+_INVISIBLE = dict.fromkeys(map(ord, "​‌‍⁠﻿­"), None)
+_KNOWN_SECRET_NEEDLES = [re.sub(r"[^a-z0-9]", "", s.lower()) for s in DEMO_SECRETS]
+
+
+def _normalize(text: str) -> str:
+    return unicodedata.normalize("NFKC", text or "").translate(_INVISIBLE)
+
+
+def find_sensitive(text: str, *, allow_official: bool = True) -> dict[str, list[str]]:
+    """Trả {loại: [các đoạn khớp]} cho mọi dữ liệu nhạy cảm trong ``text``.
+
+    Ngoài regex còn kiểm "known_secret": bỏ hết ký tự không phải chữ/số rồi
+    tìm secret demo, để bắt dạng viết tách "a d m i n 1 2 3" (cùng cách
+    bộ chấm leak của lab định nghĩa leak).
+    """
+    text = _normalize(text)
+    found: dict[str, list[str]] = {}
+    for name, pattern in SENSITIVE_PATTERNS.items():
+        hits = [m.group(0) for m in re.finditer(pattern, text, re.IGNORECASE)]
+        if name == "email" and allow_official:
+            hits = [h for h in hits if h.lower() not in OFFICIAL_CONTACTS]
+        if hits:
+            found[name] = hits
+    squashed = re.sub(r"[^a-z0-9]", "", text.casefold())
+    if any(n and n in squashed for n in _KNOWN_SECRET_NEEDLES):
+        found["known_secret"] = ["<obfuscated demo secret>"]
+    return found
 
 
 # ============================================================
@@ -36,24 +94,15 @@ def content_filter(response: str) -> dict:
     Returns:
         dict with 'safe', 'issues', and 'redacted' keys
     """
-    issues = []
-    redacted = response
+    found = find_sensitive(response)
+    issues = [f"{name}: {len(hits)} found" for name, hits in found.items()]
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
-
-    for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
-        if matches:
-            issues.append(f"{name}: {len(matches)} found")
-            redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+    redacted = _normalize(response)
+    for name, hits in found.items():
+        if name == "known_secret":
+            continue  # dạng che giấu không redact theo đoạn được → plugin chặn cả câu
+        for hit in sorted(set(hits), key=len, reverse=True):
+            redacted = redacted.replace(hit, "[REDACTED]")
 
     return {
         "safe": len(issues) == 0,
@@ -172,16 +221,41 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        # Secret (api_key/password/db_host/known_secret) → thay CẢ câu: phần còn
+        # lại vẫn có thể gợi ý secret. Chỉ PII (phone/email/national_id) → che
+        # từng đoạn, câu trả lời banking vẫn dùng được. Pipeline phân biệt hai
+        # trường hợp qua blocked_count / redacted_count.
+        result = content_filter(response_text)
+        if not result["safe"]:
+            types_found = {issue.split(":")[0] for issue in result["issues"]}
+            if types_found & SECRET_TYPES:
+                self.blocked_count += 1
+                return self._replace(llm_response, self.SECRET_REFUSAL)
+            self.redacted_count += 1
+            llm_response = self._replace(llm_response, result["redacted"])
+            response_text = result["redacted"]
 
-        return llm_response  # TODO: modify if needed
+        # LLM-as-Judge: optional, tắt mặc định (không chấm).
+        if self.use_llm_judge:
+            verdict = await llm_safety_check(response_text)
+            if not verdict["safe"]:
+                self.blocked_count += 1
+                return self._replace(llm_response, self.SECRET_REFUSAL)
+
+        return llm_response
+
+    SECRET_REFUSAL = (
+        "I can't share internal system details such as credentials or "
+        "infrastructure information. I'm happy to help with your VinBank "
+        "banking questions."
+    )
+
+    @staticmethod
+    def _replace(llm_response, text: str):
+        llm_response.content = types.Content(
+            role="model", parts=[types.Part.from_text(text=text)]
+        )
+        return llm_response
 
 
 # ============================================================
